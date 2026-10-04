@@ -6,6 +6,8 @@ from app.config import settings
 from app.db import get_db
 
 PARQUET_PATH = os.path.join(settings.BASE_DIR, "cache", "transactions.parquet")
+_DATASETS_DIR = os.path.join(os.path.dirname(settings.BASE_DIR), "Datasets")
+CSV_TXN_FILES = [os.path.join(_DATASETS_DIR, f"transactions_part_{i}.csv") for i in range(6)]
 
 def get_dashboard_summary():
     with get_db() as conn:
@@ -308,9 +310,6 @@ def get_account_transactions(account_id: str, page=1, page_size=50, txn_type=Non
 
 def get_account_network_graph(account_id: str, max_cps=25):
     """Build bipartite Account <-> Counterparty network graph with 2-hop bridging"""
-    if not os.path.exists(PARQUET_PATH):
-        return {"nodes": [], "edges": []}
-        
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT account_id, risk_score, risk_level, primary_pattern FROM accounts WHERE account_id = ?", (account_id,))
@@ -329,13 +328,24 @@ def get_account_network_graph(account_id: str, max_cps=25):
         """, (account_id,))
         all_txns_list = [dict(r) for r in cursor.fetchall()]
 
-    # 2. Fetch baseline transactions from Parquet
+    # 2. Fetch baseline transactions from Parquet (preferred fast path)
     if os.path.exists(PARQUET_PATH):
         try:
             baseline_txns = pl.scan_parquet(PARQUET_PATH).filter(pl.col("account_id") == account_id).collect()
             all_txns_list.extend(baseline_txns.to_dicts())
         except:
             pass
+    else:
+        # Fallback: scan raw CSV files when parquet cache is absent
+        existing_csvs = [f for f in CSV_TXN_FILES if os.path.exists(f)]
+        if existing_csvs:
+            try:
+                csv_txns = pl.concat([pl.scan_csv(f) for f in existing_csvs]).filter(
+                    pl.col("account_id") == account_id
+                ).collect()
+                all_txns_list.extend(csv_txns.to_dicts())
+            except Exception:
+                pass
 
     if len(all_txns_list) == 0:
         return {
